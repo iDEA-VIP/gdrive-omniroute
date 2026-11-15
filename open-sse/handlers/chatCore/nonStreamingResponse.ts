@@ -59,6 +59,7 @@ import {
 import { runNonStreamingProviderLeg } from "../chatCore/nonStreamingProviderLeg.ts";
 import type { NonStreamingProviderLegResult } from "@/lib/skills/toolLoopTypes.ts";
 import { finalizeToolLoopError } from "../chatCore/nonStreamingFinalization.ts";
+import { toFailureUsageAggregate } from "./failureUsage.ts";
 import { markCodexScopeRateLimited } from "../chatCore/codexFailover.ts";
 import { deleteSessionAccountAffinityBestEffort } from "@/lib/db/sessionAccountAffinity";
 import { writeTerminalStatus } from "@/shared/utils/terminalStatus";
@@ -256,6 +257,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       return runProviderExecutionPipeline({
         upstreamHttpRejection,
         getNextFamilyFallback: familyFallback.getNext,
+        getContextOverflowFallback: familyFallback.getForContextOverflow,
         policy,
         target: {
           provider,
@@ -463,7 +465,13 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           : buildErrorBody(err.status, err.error || "Provider request failed"),
         cacheSource: "upstream",
       });
-      persistFailureUsage(err.status, err.errorCode || `upstream_${err.status}`);
+      // The upstream may already have billed tokens (a failed Responses body carries usage):
+      // keep them on the failure row instead of recording zeros.
+      persistFailureUsage(
+        err.status,
+        err.errorCode || `upstream_${err.status}`,
+        toFailureUsageAggregate(legResult.usage)
+      );
       trackPendingRequest(
         model,
         provider,
@@ -702,7 +710,11 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       await runWithCodexResponseFence(providerResponse, () => onRequestSuccess(), true);
     }
     const successConnectionId = getCurrentConnectionId();
-    await maybeSyncClaudeExtraUsageState({
+    // After a model-family fallback the sibling answered: usage and cost belong to it.
+    const responseModel = modelAfterFamilyFallback(model, currentModel, effectiveModel, finalBody);
+    // Fire and forget, as the streaming tail does: the sync can wait up to 10 s on the usage
+    // endpoint, and the helper already swallows its own errors.
+    void maybeSyncClaudeExtraUsageState({
       provider,
       connectionId: successConnectionId,
       providerSpecificData: credentials?.providerSpecificData,
@@ -753,7 +765,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       log,
     });
     appendRequestLog({
-      model,
+      model: responseModel,
       provider,
       connectionId: successConnectionId,
       tokens: usage,
@@ -763,7 +775,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       traceEnabled,
       provider,
       connectionId: successConnectionId,
-      model,
+      model: responseModel,
       startTime,
       apiKeyInfo,
       effectiveServiceTier,
@@ -840,18 +852,19 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         : null;
     const costUsage = normalizeUsage(responseUsage);
     const costResult = costUsage
-      ? await calculateCostDetailed(provider, model, costUsage, {
+      ? await calculateCostDetailed(provider, responseModel, costUsage, {
           serviceTier: effectiveServiceTier,
         })
       : null;
     const estimatedCost = costResult?.costUsd ?? 0;
     // A metered model with no price must not pass the dollar budget as $0.
     const unpricedBudgetCost = isUnpricedMeteredCost(provider, costResult);
-    const chatCostCtx = buildCostCtx(provider, model, usage, effectiveServiceTier, traceId);
+    const chatCostCtx = buildCostCtx(provider, responseModel, usage, effectiveServiceTier, traceId);
 
     if (postCallGuardrails.blocked) {
       const guardrailMessage = postCallGuardrails.message || "Response blocked by guardrail";
       persistAttemptLogs({
+        servedModel: responseModel,
         upstreamHttpSelection,
         status: HTTP_STATUS.BAD_REQUEST,
         tokens: usage,
@@ -970,7 +983,11 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         geminiPromptCache: cacheUsageLogMeta?.geminiPromptCache,
         cacheSource: "upstream",
       });
-      persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "malformed_translated_response");
+      persistFailureUsage(
+        HTTP_STATUS.BAD_GATEWAY,
+        "malformed_translated_response",
+        toFailureUsageAggregate(usage)
+      );
       trackPendingRequest(
         model,
         provider,
@@ -1047,6 +1064,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     if (!piiTokensMinted) await saveIdempotency(idempotencyKey, translatedResponse, 200);
     reqLogger.logConvertedResponse(translatedResponse);
     persistAttemptLogs({
+      servedModel: responseModel,
       upstreamHttpSelection,
       status: 200,
       tokens: usage,
@@ -1078,7 +1096,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       apiKeyId: apiKeyInfo?.id,
       connectionId: credentials?.connectionId,
       provider,
-      model,
+      model: responseModel,
       usage,
       estimatedCost,
       log,
@@ -1092,7 +1110,6 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       providerResponse: responseBody,
       clientResponse: translatedResponse,
     });
-    const responseModel = modelAfterFamilyFallback(model, currentModel, effectiveModel, finalBody);
     const responseHeaders = buildNonStreamingResponseHeaders({
       provider,
       model: responseModel,
@@ -1133,7 +1150,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       createRoutingEvent({
         requestId: traceId || pendingRequestId || "unknown",
         provider: provider || "unknown",
-        model: model || "unknown",
+        model: responseModel || "unknown",
         strategy: isCombo ? (comboStrategy ?? "combo") : "direct",
         latencyMs: Date.now() - startTime,
         ttftMs: null,
